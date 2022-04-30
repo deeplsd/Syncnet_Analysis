@@ -455,11 +455,11 @@ if __name__ == '__main__':
     parser.add_argument('--epsilon', type=float, default=0.2, help='Max perturbation magnitude (>0)')
     parser.add_argument('--threshold', type=float, default=2, help='Threshold increase in distance to classify example as fooled')
     parser.add_argument('--itersteps', type=int, default=10, help='Number of iterative steps')
-    parser.add_argument('--perturb_audio', type=bool, default=False, help='Whether to perturb audio')
-    parser.add_argument('--perturb_video', type=bool, default=False, help='Whether to perturb video')
-    parser.add_argument('--evaluation_mode', type=bool, default=False, help='If True, runs evaluation on filename')
+    parser.add_argument('--perturb_audio', help='Whether to perturb audio', action="store_true")
+    parser.add_argument('--perturb_video', help='Whether to perturb video', action="store_true")
+    parser.add_argument('--evaluation_mode', help='If enabled, runs evaluation on filename instead', action="store_true")
     parser.add_argument('--maxrange', type=int, default='20', help='If using Dataset, range till which to run')
-    parser.add_argument('--descent', type=bool, default=False, help='If True, runs gradient descent on loss')
+    parser.add_argument('--descent', help='If enabled, runs gradient descent on loss', action="store_true")
 
     opt = parser.parse_args();
 

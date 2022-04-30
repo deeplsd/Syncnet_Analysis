@@ -1,7 +1,6 @@
 """
-ADVERSARIAL EXAMPLE GENERATION for SYNCNET
-Using Fast Gradient Sign Attack
-https://pytorch.org/tutorials/beginner/fgsm_tutorial.html
+Black Box attack for SYNCNET
+https://github.com/cg563/simple-blackbox-attack
 
 Fool model into thinking video is out-of-sync / in-syncs
 """
@@ -42,10 +41,10 @@ def calc_pdist(feat1, feat2, vshift=10):
         dists.append(torch.nn.functional.pairwise_distance(feat1[[i],:].repeat(win_size, 1), feat2p[i:i+win_size,:]))
     return dists
 
-class SyncNetInstance(torch.nn.Module):
+class SimBA_SyncNet(torch.nn.Module):
 
     def __init__(self, dropout = 0, num_layers_in_fc_layers = 1024):
-        super(SyncNetInstance, self).__init__();
+        super(SimBA_SyncNet, self).__init__();
 
         self.__S__ = S(num_layers_in_fc_layers = num_layers_in_fc_layers).cuda();
 
@@ -91,11 +90,7 @@ class SyncNetInstance(torch.nn.Module):
         sample_rate, audio = wavfile.read(os.path.join(opt.tmp_dir,opt.reference,'audio.wav'))
         audio_tensor = torch.autograd.Variable(torch.from_numpy(audio).double())
         audio_tensor.requires_grad_()
-        # mfcc = zip(*python_speech_features.mfcc(audio,sample_rate))
-        # mfcc = np.stack([np.array(i) for i in mfcc])
-        # cc = np.expand_dims(np.expand_dims(mfcc,axis=0),axis=0)
-        # cct = torch.autograd.Variable(torch.from_numpy(cc.astype(float)).float())
-
+        
         # ========== ==========
         # Check audio and video input length
         # ========== ==========
@@ -146,14 +141,15 @@ class SyncNetInstance(torch.nn.Module):
         mdist = torch.mean(torch.stack(dists,1),1)
         return mdist
     
-    def get_offset(self, opt, im_feat, cc_feat, tS):
+    def get_offset(self, opt, im_feat, cc_feat, tS, silent = False):
         # ========== ==========
         # Compute offset
         # ========== ==========
         im_feat = im_feat.clone().cpu().detach()
         cc_feat = cc_feat.clone().cpu().detach()
         
-        print('Compute time %.3f sec.' % (time.time()-tS))
+        if not silent:
+            print('Compute time %.3f sec.' % (time.time()-tS))
 
         dists = calc_pdist(im_feat,cc_feat,vshift=opt.vshift)
         mdist = torch.mean(torch.stack(dists,1),1)
@@ -170,7 +166,8 @@ class SyncNetInstance(torch.nn.Module):
         np.set_printoptions(formatter={'float': '{: 0.3f}'.format})
         # print('Framewise conf: ')
         # print(fconfm)
-        print('AV offset: \t%d \nMin dist: \t%.3f\nConfidence: \t%.3f' % (offset,minval,conf))
+        if not silent:
+            print('AV offset: \t%d \nMin dist: \t%.3f\nConfidence: \t%.3f' % (offset,minval,conf))
 
         dists_npy = np.array([ dist.numpy() for dist in dists ])
         return offset.numpy(), minval.numpy(), conf.numpy()
@@ -198,14 +195,7 @@ class SyncNetInstance(torch.nn.Module):
     def postprocess_audio(self, opt, cct):
         # Audio
         audio = torch.squeeze(torch.squeeze(cct.clone().cpu().detach(), 0), 0).numpy()
-        return audio
-    
-    def postprocess_grad(self, imtv, min_lvl = 0, max_lvl = 255):
-        # Video
-        isvideo = np.absolute(torch.squeeze(imtv.clone().cpu().detach(), 0).numpy())
-        isvideo = (max_lvl - min_lvl)*(isvideo - np.min(isvideo))/(np.max(isvideo) - np.min(isvideo) + 1e-9) + min_lvl
-        video = np.transpose(isvideo,(1,2,3,0)).astype('uint8')
-        return video
+        return audios
 
     def postprocess_diff(self, imtv, min_lvl = 0, max_lvl = 255):
         # Video
@@ -305,7 +295,85 @@ class SyncNetInstance(torch.nn.Module):
         newvidpath = vidpath.strip('.avi')+'_combined.avi'
         command = ("ffmpeg -i %s -i %s -c:v copy -c:a aac %s -hide_banner -loglevel error" % (vidpath, audpath, newvidpath))
         output = subprocess.call(command, shell=True, stdout=None)
-            
+
+    # 20-line implementation of SimBA for single feature input
+    def simba_single(self, imtv, cct, min_length, sample_rate, num_iters=10000, epsilon=0.2, pv = False, pa = False):
+        assert pv or pa
+        assert not (pv and pa)
+        # imtv = 1 x 3 x Lv x 224 x 224
+        # cct = La
+        if pv: x = imtv.contiguous()
+        else: x = cct.unsqueeze(0)
+        
+        # Run simBA
+        print(x.shape)
+        n_dims = x.view(1, -1).size(1)
+        perm = torch.randperm(n_dims)
+        last_off, last_loss, last_conf = self.get_dist(imtv, cct, min_length, sample_rate, opt, return_offset = True, silent = True)
+        for i in range(num_iters):
+            diff = torch.zeros(n_dims)
+            diff[perm[i]] = epsilon
+            if pv:
+                t_imtv = (x - diff.view(x.size())).clamp(0, 255)
+                t_cct = cct
+            else:
+                t_imtv = imtv
+                t_cct = (x - diff.view(x.size())).squeeze()
+            left_off, left_loss, left_conf = self.get_dist(t_imtv, t_cct, min_length, sample_rate, opt, return_offset = True, silent = True)
+            if left_loss > last_loss or (left_loss == last_loss and (np.abs(left_off) > np.abs(last_off) or left_conf < last_conf)):
+                print("Left")
+                x = (x + diff.view(x.size()))
+                if pv:
+                    x = x.clamp(0, 255)
+                last_loss = left_loss
+                last_conf = left_conf
+                last_off = left_off
+            else:
+                if pv:
+                    t_imtv = (x + diff.view(x.size())).clamp(0, 255)
+                    t_cct = cct
+                else:
+                    t_imtv = imtv
+                    t_cct = (x + diff.view(x.size())).squeeze()
+                right_off, right_loss, right_conf = self.get_dist(t_imtv, t_cct, min_length, sample_rate, opt, 
+                                                               return_offset = True, silent = True)
+                if right_loss > last_loss or (right_loss == last_loss and (np.abs(right_off) > np.abs(last_off) or right_conf < last_conf)):
+                    print("Right")
+                    x = (x + diff.view(x.size()))
+                    if pv:
+                        x = x.clamp(0, 255)
+                    last_loss = right_loss
+                    last_conf = right_conf
+                    last_off = right_off
+            if i % 10 == 0:
+                print("{}: Loss = {}".format(i, last_loss))
+                
+        # Return correct set of video / audio
+        if pv:
+            p_imtv = x
+            p_cct = cct
+        else:
+            p_imtv = imtv
+            p_cct = x.squeeze()
+        return p_imtv, p_cct
+    
+    def get_dist(self, imtv, cct, min_length, sample_rate, opt, return_offset = True, silent = False):
+        # Set requires_grad attribute of tensor. Important for Attack
+        imtv = Variable(imtv.data.cuda(), requires_grad=opt.perturb_video)
+        cct = Variable(cct.data.cuda(), requires_grad=opt.perturb_audio)
+
+        # Forward pass the data through the model
+        im_feat, cc_feat, tS = self.gen_feat(opt, imtv, cct, min_length, sample_rate)
+        
+        if return_offset:
+            offset, dist, conf = self.get_offset(opt, im_feat, cc_feat, tS, silent)
+            return offset, dist, conf
+        else:
+            # return loss
+            mdist = torch.mean(self.get_mdist(opt, im_feat, cc_feat))
+            loss = opt.alpha * mdist
+            return loss
+        
     def test(self, opt, dataset):
         """
         Fast Gradient Sign Attack - On Merkel Dataset
@@ -357,48 +425,18 @@ class SyncNetInstance(torch.nn.Module):
                         cct = cct[:ashft]
                     min_length = min_length - np.abs(vshft)
                 
-                # Set requires_grad attribute of tensor. Important for Attack
-                imtv = Variable(imtv.data.cuda(), requires_grad=opt.perturb_video)
-                cct = Variable(cct.data.cuda(), requires_grad=opt.perturb_audio)
-
-                # Forward pass the data through the model
-                im_feat, cc_feat, tS = self.gen_feat(opt, imtv, cct, min_length, sample_rate)
-
-                # Initial Offset
                 print("Before Adversarial Attack")
-                offset, dist, conf = self.get_offset(opt, im_feat, cc_feat, tS)
-
-                # Distance
-                mdist = torch.mean(self.get_mdist(opt, im_feat, cc_feat))
-
-                # Maximise dist - Since we do gradient ascent, we MAXIMISE the loss defined below
-                loss = opt.alpha * mdist
-
-                # Zero all existing gradients
-                self.__S__.zero_grad()
-
-                # Calculate gradients of model in backward pass
-                loss.backward()
-
-                # Collect datagrad
-                cct_grad = cct.grad
-                imtv_grad = imtv.grad
-
-                # Call FGSM Attack
-                if opt.perturb_audio:
-                    perturbed_cct = fgsm_attack(cct, opt.epsilon, cct_grad, None, None)
-                else:
-                    perturbed_cct = cct
-                if opt.perturb_video:
-                    perturbed_imtv = fgsm_attack(imtv, opt.epsilon, imtv_grad)
-                else:
-                    perturbed_imtv = imtv
+                offset, dist, conf = self.get_dist(imtv, cct, min_length, sample_rate, opt)
+                
+                print("Running Black Box Attack")
+                perturbed_imtv, perturbed_cct = self.simba_single(imtv, cct, num_iters=10000, epsilon=opt.epsilon, 
+                                                                  min_length = min_length, sample_rate = sample_rate, 
+                                                                  pv = opt.perturb_video, pa = opt.perturb_audio)
 
                 # Re-classify the perturbed image
-                im_feat, cc_feat, tS = self.gen_feat(opt, perturbed_imtv, perturbed_cct, min_length, sample_rate)
                 print('===========')
                 print("After Adversarial Attack")
-                offset_adv, dist_adv, conf_adv = self.get_offset(opt, im_feat, cc_feat, tS)
+                offset_adv, dist_adv, conf_adv = self.get_dist(perturbed_imtv, perturbed_cct, min_length, sample_rate, opt)
 
                 # Check for success
                 done += 1
@@ -415,50 +453,6 @@ class SyncNetInstance(torch.nn.Module):
                 else:
                     # Save some adv examples for visualization later
                     print("Fooled")
-
-                # Save Audio
-                # Add this as a separate function
-                # reduced_cct = np.squeeze(np.squeeze(cct.cpu().detach().numpy(), 0), 0)
-                # reduced_perturbed_cct = np.squeeze(np.squeeze(perturbed_cct.cpu().detach().numpy(), 0), 0)
-                # plt.figure(figsize = (50, 50))
-                # plt.imshow(reduced_perturbed_cct-reduced_cct, cmap='hot', interpolation='nearest')
-                # plt.savefig('out.png')
-                
-                # Saving Videos
-                f = "{}/{}/Adv_eps_{}.avi".format(opt.attack_dir, os.path.basename(videofile).strip('.avi'), opt.epsilon)
-                audio_1, video_1 = self.postprocess(opt, perturbed_imtv, perturbed_cct)
-                msg="Offset={},Dist={},Conf={}".format(round(float(offset_adv), 2),round(float(dist_adv), 2),round(float(conf_adv),2))
-                self.save(opt, audio_1, video_1, f, sample_rate, msg)
-
-                f = "{}/{}/Original.avi".format(opt.attack_dir, os.path.basename(videofile).strip('.avi'))
-                audio_2, video_2 = self.postprocess(opt, imtv, cct)
-                msg = "Offset={}, Dist={}, Conf={}".format(round(float(offset), 2), round(float(dist), 2), round(float(conf), 2))
-                self.save(opt, audio_2, video_2, f, sample_rate, msg)
-                
-                if not imtv.grad is None:
-                    print("Saving Gradients for Video")
-                    f = "{}/{}/Grad_video.avi".format(opt.attack_dir, os.path.basename(videofile).strip('.avi'))
-                    grad_video = self.postprocess_grad(imtv.grad)
-                    self.savevid(grad_video, f, "")
-
-                    f = "{}/{}/Diff_video.avi".format(opt.attack_dir, os.path.basename(videofile).strip('.avi'))
-                    diff_video = self.postprocess_diff(perturbed_imtv-imtv)
-                    self.savevid(diff_video, f, "")
-                    print("-------------------------------------------")
-                    
-                if not cct.grad is None:
-                    f1 = "{}/{}/Grad_audio.png".format(opt.attack_dir, os.path.basename(videofile).strip('.avi'))
-                    f2 = "{}/{}/Dist_Grad_audio.png".format(opt.attack_dir, os.path.basename(videofile).strip('.avi'))
-                    audf = "{}/{}/Diff_audio.wav".format(opt.attack_dir, os.path.basename(videofile).strip('.avi'))
-                    specf = "{}/{}/Diff_spec.png".format(opt.attack_dir, os.path.basename(videofile).strip('.avi'))
-                    grad_intervals = self.saveaudgrad(f1, f2, cct.grad.detach().cpu())
-                    self.savespec(specf, torch.tensor(audio_1-audio_2), sample_rate)
-                    self.saveaud(audf, audio_1-audio_2, sample_rate, np.max(np.abs(audio_2)))
-                    os.makedirs("{}/{}/Grad_segments/".format(opt.attack_dir, os.path.basename(videofile).strip('.avi')))
-                    for idx, (i, j) in enumerate(grad_intervals):
-                        ap = "{}/{}/Grad_segments/segment_{}.png".format(opt.attack_dir, os.path.basename(videofile).strip('.avi'), idx)
-                        self.savespec(ap, torch.tensor(audio_2[i:j]), sample_rate)
-                    print("Saving Gradients for Audio")
             except Exception as e:
                 print(e)
                 pass
@@ -538,7 +532,7 @@ if __name__ == '__main__':
     setattr(opt,'crop_dir',os.path.join(opt.out_dir,'pycrop'))
     setattr(opt,'attack_dir',os.path.join(opt.out_dir,'pyattack'))
 
-    opt.s = SyncNetInstance();
+    opt.s = SimBA_SyncNet();
 
     opt.s.loadParameters(opt.model);
     print("Model %s loaded."%opt.model);
