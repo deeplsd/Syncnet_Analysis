@@ -40,7 +40,7 @@ usage: BIM_attack_syncnet.py [-h] [--model MODEL] [--batch_size BATCH_SIZE] [--v
   --itersteps ITERSTEPS          Number of iterative steps (EPSILON / ITERSTEPS adjustment per-iteration)
 ```
 ### Simple Black-box Adversarial Attacks (SimBA)
-SimBA proposes a simple black-box adversarial attack method, where we randomly select from a set of orthogonal directions and take a step along that direction, if it increases the probability of the target class (or increases the LSE-D in our case). For the orthogonal directions, we try Cartesian basis and Discrete cosine basis. For the latter, we ensure that we select a low-frequency direction, as they are more likely to be adversarial). White-box attacks were found to be much more effective at generating adversarial examples.
+SimBA proposes a simple black-box adversarial attack method, where we randomly select from a set of orthogonal directions and take a step along that direction, if it increases the probability of the target class (or increases the LSE-D in our case). For the orthogonal directions, they try Cartesian basis and Discrete cosine basis. The implementation was adapted from [this GitHub repository](https://github.com/cg563/simple-blackbox-attack). In our experiments, white-box attacks were found to be much more effective at generating adversarial examples.
 > Note: Our current SimBA implementation does not support DCT basis attacks on audio.
 ```
 usage: simba_syncnet.py [-h] [--model MODEL] [--batch_size BATCH_SIZE] [--vshift VSHIFT] [--out_dir OUT_DIR] [--data_dir DATA_DIR] [--filename FILENAME]
