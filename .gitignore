@@ -154,3 +154,5 @@ pyattack/
 pytmp/
 temp.ipynb
 *.pyc
+BB_pyattack/
+temp/

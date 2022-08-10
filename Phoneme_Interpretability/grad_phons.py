@@ -1,12 +1,10 @@
 """
-ADVERSARIAL EXAMPLE GENERATION for SYNCNET
-Using Fast Gradient Sign Attack
-https://pytorch.org/tutorials/beginner/fgsm_tutorial.html
+Code to save high-gradient regions in the audio by simply backpropagating on the audio sample.
 
-Fool model into thinking video is out-of-sync / in-syncs
 """
 import sys
 sys.path.append('/srv/home/dsaha/dubbing/pytorch_speech_features')
+sys.path.append('..')
 
 import torch
 import torch.nn as nn
@@ -71,30 +69,31 @@ class SyncNetInstance(torch.nn.Module):
         # ========== ==========
 
         images = []
-
         flist = glob.glob(os.path.join(opt.tmp_dir,opt.reference,'*.jpg'))
         flist.sort()
-
         for fname in flist:
             images.append(cv2.imread(fname))
-
+        if opt.trim_t1 and opt.trim_t2:
+            print("Cropping between {} and {}".format(opt.trim_t1, opt.trim_t2))
+            images = images[int(25*opt.trim_t1): int(25*opt.trim_t2)]
+        
+        # Tensor from the cropped video segment
         im = np.stack(images,axis=3)
         im = np.expand_dims(im,axis=0)
         im = np.transpose(im,(0,3,4,1,2))
-
         imtv = torch.autograd.Variable(torch.from_numpy(im.astype(float)).float())
         
         # ========== ==========
         # Load audio
         # ========== ==========
         
+        # Create a tensor from the actual audio segment
         sample_rate, audio = wavfile.read(os.path.join(opt.tmp_dir,opt.reference,'audio.wav'))
+        if opt.trim_t1 and opt.trim_t2:
+            print("Cropping between {} and {}".format(opt.trim_t1, opt.trim_t2))
+            audio = audio[int(sample_rate*opt.trim_t1): int(sample_rate*opt.trim_t2)]
         audio_tensor = torch.autograd.Variable(torch.from_numpy(audio).double())
         audio_tensor.requires_grad_()
-        # mfcc = zip(*python_speech_features.mfcc(audio,sample_rate))
-        # mfcc = np.stack([np.array(i) for i in mfcc])
-        # cc = np.expand_dims(np.expand_dims(mfcc,axis=0),axis=0)
-        # cct = torch.autograd.Variable(torch.from_numpy(cc.astype(float)).float())
 
         # ========== ==========
         # Check audio and video input length
@@ -111,11 +110,14 @@ class SyncNetInstance(torch.nn.Module):
         # Generate video and audio feats
         # ========== ==========
 
+        # Computing audio features
         # Since in the changed implementation, cct (audio feature) is the actual audio, we need to compute the mfcc
+        # To allow direct gradient computation on the audio signal, we use pytorch-speech-features.
         mfcc = pytorch_speech_features.mfcc(cct, sample_rate).T
         cc = torch.unsqueeze(torch.unsqueeze(mfcc, dim=0), dim=0)
         cct = cc.float()
         
+        # Computing video features
         lastframe = min_length-5
         im_feat = []
         cc_feat = []
@@ -134,14 +136,13 @@ class SyncNetInstance(torch.nn.Module):
             cc_feat.append(cc_out)
 
         im_feat = torch.cat(im_feat,0)
-        cc_feat = torch.cat(cc_feat,0)
+        cc_feat = torch.cat(cc_feat,0) # L x 1024 (output dim)
         return im_feat, cc_feat, tS
 
     def get_mdist(self, opt, im_feat, cc_feat):
         # ========== ==========
         # Compute Distance
         # ========== ==========
-        
         dists = calc_pdist(im_feat,cc_feat,vshift=opt.vshift)
         mdist = torch.mean(torch.stack(dists,1),1)
         return mdist
@@ -176,6 +177,7 @@ class SyncNetInstance(torch.nn.Module):
         return offset.numpy(), minval.numpy(), conf.numpy()
 
     def evaluate(self, opt, videofile):
+        # Full evaluation (All steps)
         imtv, cct, min_length, sample_rate = self.preprocess(opt, videofile)
         imtv = Variable(imtv.data.cuda(), requires_grad=True)
         cct = Variable(cct.data.cuda(), requires_grad=True)
@@ -188,7 +190,10 @@ class SyncNetInstance(torch.nn.Module):
         self_state = self.__S__.state_dict();
         for name, param in loaded_state.items():
             self_state[name].copy_(param);
-    
+
+    # ========== ==========
+    # Postprocessing Functions
+    # ========== ==========
     def postprocess_video(self, opt, imtv):
         # Video
         isvideo = torch.squeeze(imtv.clone().cpu().detach(), 0).numpy()
@@ -219,7 +224,11 @@ class SyncNetInstance(torch.nn.Module):
         video = self.postprocess_video(opt, imtv)
         return audio, video
 
+    # ========== ==========
+    # Saving utily functions
+    # ========== ==========
     def savevid(self, video, vidpath, msg):
+        # Saving video
         # Make Dir
         if not os.path.exists(os.path.dirname(vidpath)):
             os.makedirs(os.path.dirname(vidpath))
@@ -253,12 +262,14 @@ class SyncNetInstance(torch.nn.Module):
         result.release()
     
     def saveaud(self, audpath, audio, sample_rate, m = None):
+        # Saving audio
         if m is None:
             m = np.max(np.abs(audio))
         sigf32 = (audio/m).astype(np.float32)
         wavfile.write(audpath, sample_rate, sigf32)
     
     def savespec(self, specpath, audio, sample_rate):
+        # Saving spectrograms
         feat, _ = pytorch_speech_features.fbank(audio.cuda(), sample_rate)
         feat = np.log(1+abs(feat.T.cpu().numpy()))
         ax = sns.heatmap(feat)
@@ -266,6 +277,8 @@ class SyncNetInstance(torch.nn.Module):
         plt.clf()
         
     def saveaudgrad(self, gradpath, distpath, grad):
+        # Saving audio gradient
+        grad = np.absolute(grad)
         grad = ema(np.array(grad), 100)
         ema_grad, gi = streak(np.uint16(grad > np.mean(grad)+2*np.std(grad)), 20)
         cctgradmat = grad[:100*int(len(grad)/100)].reshape(100, -1)
@@ -284,8 +297,16 @@ class SyncNetInstance(torch.nn.Module):
         print("Saved in {}".format(distpath))
         plt.clf()
         return gi
+    
+    def calcaudiosegs(self, grad):
+        # Calculate segments
+        grad = np.absolute(grad)
+        grad = ema(np.array(grad), 100)
+        ema_grad, gi = streak(np.uint16(grad > np.mean(grad)+2*np.std(grad)), 20)
+        return gi
 
     def save(self, opt, audio, video, vidpath, sample_rate, msg = 'NoMsg'):
+        # Save all
         # Make Dir
         if not os.path.exists(os.path.dirname(vidpath)):
             os.makedirs(os.path.dirname(vidpath))
@@ -305,14 +326,14 @@ class SyncNetInstance(torch.nn.Module):
         newvidpath = vidpath.strip('.avi')+'_combined.avi'
         command = ("ffmpeg -i %s -i %s -c:v copy -c:a aac %s -hide_banner -loglevel error" % (vidpath, audpath, newvidpath))
         output = subprocess.call(command, shell=True, stdout=None)
-            
+
+    # ========== ==========
+    # Main test function
+    # ========== ==========
     def test(self, opt, dataset):
         """
-        Fast Gradient Sign Attack - On Merkel Dataset
+        Saving high-gradient audio segments
         """
-        if not os.path.exists(opt.attack_dir):
-            os.makedirs(opt.attack_dir)
-        
         # What to perturb
         if not opt.perturb_audio and not opt.perturb_video:
             raise ValueError("Target Modality not specified")
@@ -325,48 +346,30 @@ class SyncNetInstance(torch.nn.Module):
         correct = 0
         done = 0
         all_del_dist = []
+        all_grad_intervals = []
         
         # Loop over all examples in test set
         for i in range(0, len(dataset)):
             try:
                 # Send the data and label to the device
                 videofile = dataset[i]
-                attack_folder = os.path.join(opt.attack_dir, os.path.basename(videofile).strip('.avi'))
-                if os.path.exists(attack_folder):
-                    rmtree(attack_folder)
-                
+
                 # For Saving
                 reference = os.path.basename(videofile).strip('.avi')
                 opt.reference = reference
 
-                if not videofile.endswith('avi'):
+                if not videofile.endswith('avi') and not videofile.endswith('avi'):
                     videofile = os.path.join(videofile, os.path.basename(videofile)+'.avi')
 
                 # Preprocess
                 imtv, cct, min_length, sample_rate = self.preprocess(opt, videofile)
-                if opt.shift != 0:
-                    print("Shifting signals by {} seconds".format(opt.shift))
-                    vshft = int(opt.shift*25)
-                    ashft = vshft*640 # 16KHz/25fps
-                    assert vshft < imtv.shape[2] and ashft < cct.shape[0]
-                    if opt.shift > 0:
-                        imtv = imtv[:,:,vshft:,:,:]
-                        cct = cct[ashft:]
-                    else:
-                        imtv = imtv[:,:,:vshft,:,:]
-                        cct = cct[:ashft]
-                    min_length = min_length - np.abs(vshft)
-                
+
                 # Set requires_grad attribute of tensor. Important for Attack
                 imtv = Variable(imtv.data.cuda(), requires_grad=opt.perturb_video)
                 cct = Variable(cct.data.cuda(), requires_grad=opt.perturb_audio)
 
                 # Forward pass the data through the model
                 im_feat, cc_feat, tS = self.gen_feat(opt, imtv, cct, min_length, sample_rate)
-
-                # Initial Offset
-                print("Before Adversarial Attack")
-                offset, dist, conf = self.get_offset(opt, im_feat, cc_feat, tS)
 
                 # Distance
                 mdist = torch.mean(self.get_mdist(opt, im_feat, cc_feat))
@@ -394,86 +397,19 @@ class SyncNetInstance(torch.nn.Module):
                 else:
                     perturbed_imtv = imtv
 
-                # Re-classify the perturbed image
-                im_feat, cc_feat, tS = self.gen_feat(opt, perturbed_imtv, perturbed_cct, min_length, sample_rate)
-                print('===========')
-                print("After Adversarial Attack")
-                offset_adv, dist_adv, conf_adv = self.get_offset(opt, im_feat, cc_feat, tS)
-
-                # Check for success
-                done += 1
-                all_del_dist.append(dist_adv - dist)
-                # Condition for correct prediction
-                # Ascent - dist_adv not much increased
-                # Descent - dist_adv not much decreased
-                cond = ((dist_adv - dist) < opt.threshold if not opt.descent else (dist_adv - dist) > -opt.threshold)
-                if cond:
-                    correct += 1
-                    # Special case for saving 0 epsilon examples
-                    if (opt.epsilon == 0):
-                        print("Fooled")
-                else:
-                    # Save some adv examples for visualization later
-                    print("Fooled")
-
-                # Save Audio
-                # Add this as a separate function
-                # reduced_cct = np.squeeze(np.squeeze(cct.cpu().detach().numpy(), 0), 0)
-                # reduced_perturbed_cct = np.squeeze(np.squeeze(perturbed_cct.cpu().detach().numpy(), 0), 0)
-                # plt.figure(figsize = (50, 50))
-                # plt.imshow(reduced_perturbed_cct-reduced_cct, cmap='hot', interpolation='nearest')
-                # plt.savefig('out.png')
-                
-                # Saving Videos
-                f = "{}/{}/Adv_eps_{}.avi".format(opt.attack_dir, os.path.basename(videofile).strip('.avi'), opt.epsilon)
-                audio_1, video_1 = self.postprocess(opt, perturbed_imtv, perturbed_cct)
-                msg="Offset={},Dist={},Conf={}".format(round(float(offset_adv), 2),round(float(dist_adv), 2),round(float(conf_adv),2))
-                self.save(opt, audio_1, video_1, f, sample_rate, msg)
-
-                f = "{}/{}/Original.avi".format(opt.attack_dir, os.path.basename(videofile).strip('.avi'))
-                audio_2, video_2 = self.postprocess(opt, imtv, cct)
-                msg = "Offset={}, Dist={}, Conf={}".format(round(float(offset), 2), round(float(dist), 2), round(float(conf), 2))
-                self.save(opt, audio_2, video_2, f, sample_rate, msg)
-                
-                if not imtv.grad is None:
-                    print("Saving Gradients for Video")
-                    f = "{}/{}/Grad_video.avi".format(opt.attack_dir, os.path.basename(videofile).strip('.avi'))
-                    grad_video = self.postprocess_grad(imtv.grad)
-                    self.savevid(grad_video, f, "")
-
-                    f = "{}/{}/Diff_video.avi".format(opt.attack_dir, os.path.basename(videofile).strip('.avi'))
-                    diff_video = self.postprocess_diff(perturbed_imtv-imtv)
-                    self.savevid(diff_video, f, "")
-                    print("-------------------------------------------")
-                    
                 if not cct.grad is None:
-                    f1 = "{}/{}/Grad_audio.png".format(opt.attack_dir, os.path.basename(videofile).strip('.avi'))
-                    f2 = "{}/{}/Dist_Grad_audio.png".format(opt.attack_dir, os.path.basename(videofile).strip('.avi'))
-                    audf = "{}/{}/Diff_audio.wav".format(opt.attack_dir, os.path.basename(videofile).strip('.avi'))
-                    specf = "{}/{}/Diff_spec.png".format(opt.attack_dir, os.path.basename(videofile).strip('.avi'))
-                    grad_intervals = self.saveaudgrad(f1, f2, cct.grad.detach().cpu())
-                    self.savespec(specf, torch.tensor(audio_1-audio_2), sample_rate)
-                    self.saveaud(audf, audio_1-audio_2, sample_rate, np.max(np.abs(audio_2)))
-                    os.makedirs("{}/{}/Grad_segments/".format(opt.attack_dir, os.path.basename(videofile).strip('.avi')))
-                    for idx, (i, j) in enumerate(grad_intervals):
-                        ap = "{}/{}/Grad_segments/segment_{}.png".format(opt.attack_dir, os.path.basename(videofile).strip('.avi'), idx)
-                        self.savespec(ap, torch.tensor(audio_2[i:j]), sample_rate)
-                    print("Saving Gradients for Audio")
+                    grad_intervals = self.calcaudiosegs(cct.grad.detach().cpu())
+                    t_offset = 0
+                    if opt.trim_t1:
+                        t_offset = opt.trim_t1
+                    time_interval = [list(t_offset + g/16000) for g in grad_intervals]
+                    all_grad_intervals.append(time_interval)
+
             except Exception as e:
                 print(e)
-                pass
-        
-        # Calculate final accuracy for this epsilon
-        final_acc = correct/float(done)
-        avg_del_dist = np.mean(all_del_dist)
-        print("Epsilon: {}\tTest Accuracy with threshold {} = {} / {} = {}\nAverage increase in distance = {}".format(opt.epsilon,
-                                                                                                                      opt.threshold,
-                                                                                                                      correct, done,
-                                                                                                                      final_acc,
-                                                                                                                      avg_del_dist))
 
-        # Return the accuracy and an adversarial example
-        return final_acc
+        # Return the high-gradient time-segments
+        return all_grad_intervals
             
 # FGSM attack code
 def fgsm_attack(image, epsilon, data_grad, min_lvl = 0, max_lvl = 255):
@@ -490,76 +426,58 @@ def fgsm_attack(image, epsilon, data_grad, min_lvl = 0, max_lvl = 255):
     # Return the perturbed image
     return perturbed_image
 
-def evaluate(opt):
-    if opt.filename != '':
-        filename = opt.filename
-        print("Evaluating {}".format(filename))
-        reference = filename.split('/')[-1].split('.')[0]
-        opt.reference = reference
-        offset, dist, conf = opt.s.evaluate(opt,videofile=filename)
-        print("Offset", offset, "\nDist", dist, "\nConf", conf)
-    else:
-        with open(opt.filename_list, 'r') as f:
-            data = [x.strip() for x in f.readlines()]
-        dists = []
-        for filename in data:
-            print(filename)
-            reference = filename.split('/')[-1].split('.')[0]
-            opt.reference = reference
-            offset, dist, conf = opt.s.evaluate(opt,videofile=filename)
-            print("Offset", offset, "\nDist", dist, "\nConf", conf)
-            dists.append(dist)
-        print("Average = {}".format(np.mean(dists)))
+# Dict --> Object
+class MyObject:
+    def __init__(self, d=None):
+        if d is not None:
+            for key, value in d.items():
+                setattr(self, key, value)
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description = "SyncNet Evaluation")
-    parser.add_argument('--model', type=str, default="syncnet_evaluation/data/syncnet_v2.model", help='')
-    parser.add_argument('--batch_size', type=int, default='20', help='')
-    parser.add_argument('--vshift', type=int, default='15', help='')
-    parser.add_argument('--out_dir', type=str, default='', help='')
-    parser.add_argument('--data_dir', type=str, default='', help='Can be a file name or a folder containing several other folders')
-    parser.add_argument('--filename', type=str, default='', help='Name of the video file')
-    parser.add_argument('--filename_list', type=str, default='', help='Path to file with video paths')
-    parser.add_argument('--alpha', type=float, default=1e5, help='Loss Weighing Term')
-    parser.add_argument('--epsilon', type=float, default=0.2, help='Max perturbation magnitude (>0)')
-    parser.add_argument('--threshold', type=float, default=2, help='Threshold increase in distance to classify example as fooled')
-    parser.add_argument('--perturb_audio', help='Whether to perturb audio', action="store_true")
-    parser.add_argument('--perturb_video', help='Whether to perturb video', action="store_true")
-    parser.add_argument('--evaluation_mode', help='If enabled, runs evaluation on filename instead', action="store_true")
-    parser.add_argument('--maxrange', type=int, default='20', help='If using Dataset, range till which to run')
-    parser.add_argument('--descent', help='If enabled, runs gradient descent on loss', action="store_true")
-    parser.add_argument('--shift', type=float, default='0', help='Shift in secs')
-
-    opt = parser.parse_args();
-
+# Load Model
+def initialize():
+    # Default params
+    opt = {'model': '../syncnet_evaluation/data/syncnet_v2.model', 
+           'batch_size': 20, 'vshift': 15, 
+           'out_dir': '', 
+           'data_dir': '', 
+           'filename': None, 
+           'filename_list': '', 
+           'alpha': 100000.0, 
+           'epsilon': 0.2, 
+           'threshold': 2, 
+           'perturb_audio': True, 
+           'perturb_video': False, 
+           'evaluation_mode': False, 
+           'maxrange': 20, 
+           'descent': False, 
+           'shift': 0.0, 
+           'trim_t1': None, 
+           'trim_t2': None}
+    opt = MyObject(opt)
+    opt.s = SyncNetInstance();
+    opt.s.loadParameters(opt.model);
+    print("Model %s loaded."%opt.model);
+    
     setattr(opt,'avi_dir',os.path.join(opt.out_dir,'pyavi'))
     setattr(opt,'tmp_dir',os.path.join(opt.out_dir,'pytmp'))
     setattr(opt,'work_dir',os.path.join(opt.out_dir,'pywork'))
     setattr(opt,'crop_dir',os.path.join(opt.out_dir,'pycrop'))
     setattr(opt,'attack_dir',os.path.join(opt.out_dir,'pyattack'))
-
-    opt.s = SyncNetInstance();
-
-    opt.s.loadParameters(opt.model);
-    print("Model %s loaded."%opt.model);
     
-    if opt.evaluation_mode:
-        # Proper Evaluation
-        evaluate(opt)
+    return opt 
+
+def run(opt, filename, t1, t2):
+    # Modify the attack .py script to collect high-gradient video segments
+    opt.filename = filename
+    
+    if opt.filename != '':
+        data = [opt.filename]
+    elif opt.filename_list != '':
+        with open(opt.filename_list, 'r') as f:
+            data = [x.strip() for x in f.readlines()]
     else:
-        if opt.filename != '':
-            data = [opt.filename]
-        elif opt.filename_list != '':
-            with open(opt.filename_list, 'r') as f:
-                data = [x.strip() for x in f.readlines()]
-        else:
-            # Dataset
-            p = '../visualHeroes/german_nb/configs/final_new_merkel_configs/merkel_config_refined_old.json'
-            dataset = Syncnet_Dataset(config_path = p)
-            maxlim = min(len(dataset), opt.maxrange)
-            data = []
-            for i in range(maxlim):
-                data.append(dataset[i][2])
-                
-        # FGSM Attack
-        opt.s.test(opt, data)
+        raise Exception("Data source not specified")
+            
+    # FGSM Attack
+    grad_intervals = opt.s.test(opt, data)
+    return grad_intervals

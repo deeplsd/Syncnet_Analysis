@@ -4,7 +4,7 @@ from TTS.utils.io import load_config
 from torch.utils.data import Dataset
 
 class Syncnet_Dataset(Dataset):
-    """Face Landmarks dataset."""
+    """SyncNet dataset."""
 
     def __init__(self, config_path, split = 'train'):
         """
