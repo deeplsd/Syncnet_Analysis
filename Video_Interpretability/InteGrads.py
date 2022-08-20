@@ -25,9 +25,11 @@ from shutil import rmtree
 from librosa.feature.inverse import mfcc_to_audio
 import seaborn as sns
 import matplotlib.pylab as plt
+import matplotlib.cm as cm
 import pytorch_speech_features
 from captum.attr import IntegratedGradients
 from utils.misc import savepair
+from scipy.ndimage.filters import gaussian_filter
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -225,11 +227,18 @@ class SyncNetInstance(torch.nn.Module):
         audio = self.postprocess_audio(opt, cct)
         video = self.postprocess_video(opt, imtv)
         return audio, video
-    
+        
     def savevidoverlay(self, video, mask, f, msg):
-        mask = np.mean(mask, axis = -1)
-        mask = np.repeat(mask[:, :, :, np.newaxis], 3, axis=-1)
-        overlaid = np.where(mask>=10, 255, video[:-1,:,:,:])
+        th = 5
+        indicator = np.repeat(np.mean(mask, axis = -1)[:, :, :, np.newaxis], 3, axis=-1)
+        scaled_mask = (gaussian_filter(mask, sigma=5))
+        scaled_mask = (scaled_mask*(np.array([255/x.max() for x in scaled_mask]).reshape(-1,1,1,1))).astype(np.uint8)
+        heatmaps = np.zeros_like(mask)
+        for i, sm in enumerate(scaled_mask):
+            heatmaps[i] = cv2.applyColorMap(sm, cv2.COLORMAP_JET) * (indicator[i] > th)
+            heatmaps[i] = cv2.dilate(heatmaps[i], kernel = np.ones((3, 3), np.uint8))
+        overlaid = np.zeros_like(heatmaps)
+        overlaid = (0.7*video[:-1,:,:,:] + 0.3*heatmaps).astype(np.uint8)
         self.savevid(overlaid, f, msg)
 
     def savevid(self, video, vidpath, msg):
