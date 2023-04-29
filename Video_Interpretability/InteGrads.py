@@ -230,6 +230,8 @@ class SyncNetInstance(torch.nn.Module):
         
     def savevidoverlay(self, video, mask, f, msg):
         th = 5
+        for i in range(len(video)):
+            video[i] = np.repeat(cv2.cvtColor(video[i], cv2.COLOR_BGR2GRAY)[:, :, np.newaxis], 3, axis=-1)
         indicator = np.repeat(np.mean(mask, axis = -1)[:, :, :, np.newaxis], 3, axis=-1)
         scaled_mask = (gaussian_filter(mask, sigma=5))
         scaled_mask = (scaled_mask*(np.array([255/x.max() for x in scaled_mask]).reshape(-1,1,1,1))).astype(np.uint8)
